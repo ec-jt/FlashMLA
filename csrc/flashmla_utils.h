@@ -51,10 +51,17 @@ do { \
 #else
 
 // We define the following macros to detect the CUDA architecture, so that we can enable/disable certains kernels that depends on specific architectures.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
 #define IS_SM100 1
 #else
 #define IS_SM100 0
+#endif
+
+// SM120a (Grace-Blackwell GB200 / RTX 5090) detection
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200) && (__CUDA_ARCH__ < 1300)
+#define IS_SM120 1
+#else
+#define IS_SM120 0
 #endif
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)

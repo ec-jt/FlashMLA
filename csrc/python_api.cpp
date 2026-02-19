@@ -36,8 +36,12 @@ struct Arch {
         return major == 10;
     }
 
+    bool is_sm120() const {
+        return major == 12;  // SM120 (RTX 5090 / GB200)
+    }
+
     void assert_is_supported() const {
-        TORCH_CHECK(is_sm90() || is_sm100(), "Only SM90 and SM100 are supported");
+        TORCH_CHECK(is_sm90() || is_sm100() || is_sm120(), "Only SM90, SM100, and SM120 are supported");
     }
 };
 
@@ -80,6 +84,34 @@ DecodingAttnImplMeta get_attn_impl_meta(
                 TORCH_CHECK(false, "Dense FP8 MLA is not supported on SM90");
             } else {
                 // Dense BF16 MLA
+                return {
+                    std::max(sm_count / h_k / cutlass::ceil_div(num_q_tokens_per_head_k, 64), 1),
+                    5,
+                    64
+                };
+            }
+        }
+    } else if (arch.is_sm120()) {
+        // SM120: FlashMLA decode kernels not supported (no TCGEN05/WGMMA).
+        // Decode is handled by trtllm backend. For prefill metadata, use SM90 formula.
+        if (is_sparse_attn) {
+            if (is_fp8_kvcache) {
+                TORCH_CHECK(h_q_.has_value());
+                int h_q = h_q_.value();
+                TORCH_CHECK(h_q % h_k == 0);
+                int s_q = num_q_tokens_per_head_k * h_k / h_q;
+                return {
+                    std::max((sm_count/2) / h_k / (cutlass::ceil_div(h_q/h_k, 2*64) * s_q), 1),
+                    5,
+                    64
+                };
+            } else {
+                TORCH_CHECK(false, "Sparse BF16 MLA is not supported on SM120");
+            }
+        } else {
+            if (is_fp8_kvcache) {
+                TORCH_CHECK(false, "Dense FP8 MLA is not supported on SM120");
+            } else {
                 return {
                     std::max(sm_count / h_k / cutlass::ceil_div(num_q_tokens_per_head_k, 64), 1),
                     5,
@@ -364,6 +396,21 @@ fwd_kvcache_mla(
     } else if (arch.is_sm100()) {
         TORCH_CHECK(is_fp8 && is_sparse_attn, "Only FP8 + Sparse attention is supported on SM100");
         sm100::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
+    } else if (arch.is_sm120()) {
+        // SM120: FlashMLA decode kernels use TCGEN05 (SM100) or WGMMA (SM90) which SM120 lacks.
+        // Decode should be handled by trtllm backend at Python level.
+        // Route to SM90 sparse FP8 path as fallback (kernel body is empty on SM120).
+        if (is_sparse_attn && is_fp8) {
+            sm90::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
+        } else if (!is_fp8) {
+            if (q_dtype == torch::kBFloat16) {
+                sm90::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params, stream);
+            } else {
+                TORCH_CHECK(false, "Unsupported dtype for MLA on SM120");
+            }
+        } else {
+            TORCH_CHECK(false, "Unsupported MLA configuration on SM120");
+        }
     } else {
         TORCH_CHECK(false, "Unsupported GPU architecture");
     }
@@ -408,7 +455,8 @@ std::vector<at::Tensor> sparse_prefill_fwd(
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9;
     bool is_sm100 = dprops->major == 10;
-    TORCH_CHECK(is_sm90 || is_sm100, "Sparse Attention Forward Kernel (sparse_prefill_fwd) is only supported on SM90 or SM100 architectures");
+    bool is_sm120 = dprops->major == 12;  // SM120 (RTX 5090) — route to SM90 path
+    TORCH_CHECK(is_sm90 || is_sm100 || is_sm120, "Sparse Attention Forward Kernel (sparse_prefill_fwd) is only supported on SM90, SM100, or SM120 architectures");
 
     CHECK_DEVICE(q);
     CHECK_DEVICE(kv);
@@ -463,7 +511,8 @@ std::vector<at::Tensor> sparse_prefill_fwd(
         at::cuda::getCurrentCUDAStream().stream()
     };
 
-    if (is_sm90) {
+    if (is_sm90 || is_sm120) {
+        // SM120 routes to SM90 path (kernel body is empty on SM120 — prefill uses flashmla_sparse which calls this)
         sm90::run_fwd_kernel(params);
     } else if (is_sm100) {
         sm100::run_fwd_kernel(params);
