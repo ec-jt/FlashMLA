@@ -19,6 +19,9 @@
 #include "sm100/decode/sparse_fp8/splitkv_mla.h"
 #include "sm100/prefill/dense/interface.h"
 #include "sm100/prefill/sparse/fwd.h"
+#include "sm120/decode/dense/splitkv_mla.h"
+#include "sm120/decode/sparse_fp8/splitkv_mla.h"
+#include "sm120/prefill/sparse/fwd.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
@@ -397,19 +400,28 @@ fwd_kvcache_mla(
         TORCH_CHECK(is_fp8 && is_sparse_attn, "Only FP8 + Sparse attention is supported on SM100");
         sm100::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
     } else if (arch.is_sm120()) {
-        // SM120: FlashMLA decode kernels use TCGEN05 (SM100) or WGMMA (SM90) which SM120 lacks.
-        // Decode should be handled by trtllm backend at Python level.
-        // Route to SM90 sparse FP8 path as fallback (kernel body is empty on SM120).
-        if (is_sparse_attn && is_fp8) {
-            sm90::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
-        } else if (!is_fp8) {
-            if (q_dtype == torch::kBFloat16) {
-                sm90::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params, stream);
+        // SM120: Native kernels using mma.sync (no WGMMA/TCGEN05) with K-tiled smem (<100KB)
+        if (is_sparse_attn) {
+            if (is_fp8) {
+                TORCH_CHECK(q_dtype == torch::kBFloat16, "Sparse FP8 MLA only supports BFloat16 on SM120");
+                sm120::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
             } else {
-                TORCH_CHECK(false, "Unsupported dtype for MLA on SM120");
+                TORCH_CHECK(false, "Only FP8 kvcache is supported for sparse MLA on SM120");
             }
         } else {
-            TORCH_CHECK(false, "Unsupported MLA configuration on SM120");
+            if (is_fp8) {
+                TORCH_CHECK(false, "Dense FP8 MLA is not supported on SM120");
+            } else {
+                if (q_dtype == torch::kBFloat16) {
+                    sm120::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params, stream);
+                } else if (q_dtype == torch::kHalf) {
+#ifndef FLASH_MLA_DISABLE_FP16
+                    sm120::run_flash_splitkv_mla_kernel<cutlass::half_t>(params, stream);
+#endif
+                } else {
+                    TORCH_CHECK(false, "Unsupported dtype for dense MLA on SM120");
+                }
+            }
         }
     } else {
         TORCH_CHECK(false, "Unsupported GPU architecture");
@@ -511,9 +523,11 @@ std::vector<at::Tensor> sparse_prefill_fwd(
         at::cuda::getCurrentCUDAStream().stream()
     };
 
-    if (is_sm90 || is_sm120) {
-        // SM120 routes to SM90 path (kernel body is empty on SM120 — prefill uses flashmla_sparse which calls this)
+    if (is_sm90) {
         sm90::run_fwd_kernel(params);
+    } else if (is_sm120) {
+        // SM120: Native prefill kernel using mma.sync (<100KB smem)
+        sm120::run_fwd_kernel(params);
     } else if (is_sm100) {
         sm100::run_fwd_kernel(params);
     } else {

@@ -48,6 +48,7 @@ do { \
 #if defined(__CLION_IDE__) || defined(__VSCODE_IDE__)
 #define IS_SM100 1
 #define IS_SM90 1
+#define IS_SM120 1
 #else
 
 // We define the following macros to detect the CUDA architecture, so that we can enable/disable certains kernels that depends on specific architectures.
